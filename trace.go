@@ -10,7 +10,7 @@ A trace.Trace provides tracing for short-lived objects, usually requests.
 A request handler might be implemented like this:
 
 	func fooHandler(w http.ResponseWriter, req *http.Request) {
-		tr := trace.New("mypkg.Foo", req.URL.Path)
+		tr := trace.New("mypkg.Foo", req.URL.Path, false)
 		defer tr.Finish()
 		...
 		tr.LazyPrintf("some event %q happened", str)
@@ -210,7 +210,7 @@ func Render(w io.Writer, req *http.Request, sensitive bool) {
 			data.Traces = b.Copy(data.Traced)
 		}
 	default:
-		if f := getFamily(data.Family, false); f != nil {
+		if f := getFamily(data.Family, false, false); f != nil {
 			var obs timeseries.Observable
 			f.LatencyMu.RLock()
 			switch o := data.Bucket - bucketsPerFamily; o {
@@ -244,7 +244,7 @@ func Render(w io.Writer, req *http.Request, sensitive bool) {
 }
 
 func GetFamilyTotalString(family string) string {
-	if f := getFamily(family, false); f != nil {
+	if f := getFamily(family, false, false); f != nil {
 		var obs timeseries.Observable
 		f.LatencyMu.RLock()
 		obs = f.Latency.Total()
@@ -255,6 +255,45 @@ func GetFamilyTotalString(family string) string {
 	}
 
 	return ""
+}
+
+type expVarData struct {
+	Count, Median int64
+	Mean, StdDev  float64
+	Time          time.Time
+}
+
+//获取所有可用于/debug/vars 调用的请求信息
+func GetAllExpvarFamily(state int) interface{} {
+	mp := make(map[string]interface{})
+	for fam, data := range completedTraces {
+		if !data.expvar {
+			continue
+		}
+		if f := getFamily(fam, false, false); f != nil {
+			var obs timeseries.Observable
+			f.LatencyMu.RLock()
+			switch state {
+			case 0:
+				obs = f.Latency.Minute()
+			case 1:
+				obs = f.Latency.Hour()
+			case 2:
+				obs = f.Latency.Total()
+			}
+			f.LatencyMu.RUnlock()
+			if obs != nil {
+				nd := obs.(*histogram).newData()
+				m := make(map[string]interface{})
+				m["Count"] = nd.Count
+				m["Mean"] = time.Duration(int64(nd.Mean * 1000.0))
+				m["StdDev"] = time.Duration(int64(nd.StandardDeviation * 1000.0))
+				m["Median"] = time.Duration(int64(nd.Median * 1000.0))
+				mp[fam] = m
+			}
+		}
+	}
+	return mp
 }
 
 func GetFamilyDetailString(family string, bucket int) string {
@@ -289,7 +328,7 @@ func parseArgs(req *http.Request) (fam string, b int, ok bool) {
 }
 
 func lookupBucket(fam string, b int) *traceBucket {
-	f := getFamily(fam, false)
+	f := getFamily(fam, false, false)
 	if f == nil || b < 0 || b >= len(f.Buckets) {
 		return nil
 	}
@@ -349,11 +388,11 @@ func (l *lazySprintf) String() string {
 }
 
 // New returns a new Trace with the specified family and title.
-func New(family, title string) Trace {
+func New(family, title string, expvar bool) Trace {
 	tr := newTrace()
 	tr.ref()
 	tr.ID = atomic.AddInt64(&traceID, 1)
-	tr.Family, tr.Title = family, title
+	tr.Family, tr.Title, tr.expvar = family, title, expvar
 	tr.Start = time.Now()
 	tr.maxEvents = maxEventsPerTrace
 	tr.events = tr.eventsBuf[:0]
@@ -379,7 +418,7 @@ func New(family, title string) Trace {
 	// own goroutine, but only if the family isn't allocated yet.
 	completedMu.RLock()
 	if _, ok := completedTraces[tr.Family]; !ok {
-		go allocFamily(tr.Family)
+		go allocFamily(tr.Family, tr.expvar)
 	}
 	completedMu.RUnlock()
 
@@ -399,7 +438,7 @@ func (tr *trace) Finish() {
 	activeMu.RUnlock()
 	m.Remove(tr)
 
-	f := getFamily(tr.Family, true)
+	f := getFamily(tr.Family, true, tr.expvar)
 	for _, b := range f.Buckets {
 		if b.Cond.match(tr) {
 			b.Add(tr)
@@ -533,22 +572,23 @@ func getActiveTraces(fam string) traceList {
 	return s.FirstN(maxActiveTraces)
 }
 
-func getFamily(fam string, allocNew bool) *family {
+func getFamily(fam string, allocNew, expvar bool) *family {
 	completedMu.RLock()
 	f := completedTraces[fam]
 	completedMu.RUnlock()
 	if f == nil && allocNew {
-		f = allocFamily(fam)
+		f = allocFamily(fam, expvar)
 	}
 	return f
 }
 
-func allocFamily(fam string) *family {
+func allocFamily(fam string, expvar bool) *family {
 	completedMu.Lock()
 	defer completedMu.Unlock()
 	f := completedTraces[fam]
 	if f == nil {
 		f = newFamily()
+		f.expvar = expvar
 		completedTraces[fam] = f
 	}
 	return f
@@ -562,6 +602,9 @@ type family struct {
 	// latency time series
 	LatencyMu sync.RWMutex
 	Latency   *timeseries.MinuteHourSeries
+
+	//show in expvar tool
+	expvar bool
 }
 
 func newFamily() *family {
@@ -712,6 +755,9 @@ type trace struct {
 
 	// Title is the title of this trace.
 	Title string
+
+	//show in expvar tool
+	expvar bool
 
 	// Timing information.
 	Start   time.Time
